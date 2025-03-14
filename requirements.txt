@@ -8,3 +8,5 @@ torchao==0.9.0
 silentcipher @ git+https://github.com/SesameAILabs/silentcipher@master
 torchaudio==2.4.0+cu121 
 torchvision==0.17.0+cu121 
+sounddevice==0.4.7
+SpeechRecognition==3.10.0
