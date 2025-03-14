@@ -1,5 +1,4 @@
-torch==2.4.0
-torchaudio==2.4.0
+torch==2.4.0+cu121
 tokenizers==0.21.0
 transformers==4.49.0
 huggingface_hub==0.28.1
@@ -7,3 +6,5 @@ moshi==0.2.2
 torchtune==0.4.0
 torchao==0.9.0
 silentcipher @ git+https://github.com/SesameAILabs/silentcipher@master
+torchaudio==2.4.0+cu121 
+torchvision==0.17.0+cu121 
