@@ -11,28 +11,85 @@ import os
 import sys
 import warnings
 import traceback
+import platform
+import signal
 from generator import load_csm_1b, Segment
 
 # Suppress unnecessary warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# Cross-platform timeout handler
+class TimeoutHandler:
+    def __init__(self, seconds=60, error_message='Operation timed out'):
+        self.seconds = seconds
+        self.error_message = error_message
+        self.platform = platform.system()
+        
+    def handle_timeout(self, signum, frame):
+        raise TimeoutError(self.error_message)
+        
+    def __enter__(self):
+        # SIGALRM is not available on Windows
+        if self.platform != 'Windows':
+            signal.signal(signal.SIGALRM, self.handle_timeout)
+            signal.alarm(self.seconds)
+        return self
+        
+    def __exit__(self, type, value, traceback):
+        if self.platform != 'Windows':
+            signal.alarm(0)
+
+# Thread with timeout for Windows compatibility
+def run_with_timeout(func, args=(), kwargs={}, timeout=60):
+    """Run a function with a timeout, works on all platforms."""
+    result_queue = queue.Queue()
+    error_ref = []
+    
+    def wrapper():
+        try:
+            result = func(*args, **kwargs)
+            result_queue.put(result)
+        except Exception as e:
+            error_ref.append(e)
+            result_queue.put(None)
+    
+    thread = threading.Thread(target=wrapper)
+    thread.daemon = True
+    thread.start()
+    thread.join(timeout=timeout)
+    
+    if thread.is_alive():
+        return None, TimeoutError(f"Function timed out after {timeout} seconds")
+    
+    try:
+        result = result_queue.get(block=False)
+        if error_ref:
+            return None, error_ref[0]
+        return result, None
+    except queue.Empty:
+        return None, RuntimeError("Thread completed but no result was returned")
 
 # Check for required packages and install if missing
 def check_requirements():
-    required_packages = [
-        "speech_recognition",
-        "huggingface_hub",
-        "transformers",
-        "accelerate",
-        "bitsandbytes"  # Required for efficient loading of large models
-    ]
+    required_packages = {
+        "speech_recognition": "SpeechRecognition",  # Package name may differ from import name
+        "huggingface_hub": "huggingface_hub",
+        "transformers": "transformers",
+        "accelerate": "accelerate",
+        "bitsandbytes": "bitsandbytes",  # Required for efficient loading of large models
+        "scipy": "scipy",  # Required for audio processing
+        "torch": "torch",
+        "torchaudio": "torchaudio"
+    }
     
     missing_packages = []
-    for pkg in required_packages:
+    for import_name, pkg_name in required_packages.items():
         try:
-            __import__(pkg)
+            __import__(import_name)
         except ImportError:
-            missing_packages.append(pkg)
+            missing_packages.append(pkg_name)
     
     if missing_packages:
         print(f"⚠️ Missing required packages: {', '.join(missing_packages)}")
@@ -41,7 +98,10 @@ def check_requirements():
             import subprocess
             for pkg in missing_packages:
                 print(f"📦 Installing {pkg}...")
-                subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+                try:
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", pkg])
+                except subprocess.CalledProcessError:
+                    print(f"⚠️ Failed to install {pkg}. You may need to install it manually.")
     
     # Import after installation
     import speech_recognition as sr
@@ -59,6 +119,7 @@ if torch.cuda.is_available():
     try:
         # Test a small tensor operation to verify CUDA works
         test_tensor = torch.zeros(1).cuda()
+        test_tensor = test_tensor + 1  # Force a computation
         device = "cuda"
         del test_tensor
         
@@ -75,9 +136,33 @@ if torch.cuda.is_available():
         print(f"⚠️ CUDA available but encountered an error: {e}")
         print("⚠️ Falling back to CPU")
 
-torch.set_grad_enabled(False)  # Ensure no gradients are computed
-if device == "cpu":
-    print("🖥️ Using CPU (both models will be very slow)")
+# Set torch grad mode off globally for inference
+torch.set_grad_enabled(False)
+
+# Explicitly set torch backends for optimization
+if device == "cuda":
+    try:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        # Enable memory efficient attention if available
+        if hasattr(torch.backends, 'cuda') and hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+        # Enable flash attention if available
+        if hasattr(torch.backends, 'cuda') and hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+            torch.backends.cuda.enable_flash_sdp(True)
+    except Exception as e:
+        print(f"⚠️ Could not set all CUDA optimizations: {e}")
+else:
+    print("🖥️ Using CPU (both speech and text generation will be very slow)")
+    # Try to set num threads for better CPU performance
+    try:
+        # Use a reasonable number of threads (not all CPUs to avoid system freezes)
+        cpu_count = os.cpu_count() or 4
+        num_threads = max(4, min(cpu_count - 1, 16))  # At least 4, at most 16, but leave one CPU free
+        torch.set_num_threads(num_threads)
+        print(f"🖥️ CPU threads: {torch.get_num_threads()}")
+    except:
+        pass
 
 # Auto-configure settings based on available resources
 def configure_settings():
@@ -88,9 +173,18 @@ def configure_settings():
         "max_audio_length": 20000,   # Max milliseconds for generated audio
         "temperature": 0.7,     # Temperature for text generation
         "fallback_temp": 0.5,   # Temperature for fallback generation
-        "max_history": 12,      # Max conversation history entries
+        "max_history": 10,      # Max conversation history entries
         "recovery_audio_ms": 3000,  # Short audio duration for recovery
+        "gemma_max_tokens": 100,  # Default max tokens for Gemma responses
+        "model_timeout": 300,   # Timeout for model loading (seconds)
+        "speech_timeout": 60    # Timeout for speech generation (seconds)
     }
+    
+    # Platform-specific optimizations
+    if platform.system() == 'Windows':
+        # Windows often needs larger timeouts
+        settings["model_timeout"] = 400
+        settings["speech_timeout"] = 80
     
     # Adjust settings for low-memory devices
     if device == "cpu":
@@ -98,6 +192,8 @@ def configure_settings():
         settings["context_limit"] = 2
         settings["max_audio_length"] = 10000
         settings["recovery_audio_ms"] = 2000
+        settings["gemma_max_tokens"] = 50
+        settings["model_timeout"] = 600  # Longer timeout for CPU
     elif device == "cuda":
         # Check GPU memory and adjust accordingly
         try:
@@ -105,17 +201,20 @@ def configure_settings():
             if gpu_mem < 8:  # Less than 8GB
                 settings["context_size"] = 4
                 settings["context_limit"] = 2
-                settings["max_audio_length"] = 10000
+                settings["max_audio_length"] = 8000
+                settings["gemma_max_tokens"] = 30
                 print("⚠️ Very limited GPU memory detected, reducing settings significantly")
             elif gpu_mem < 16:  # Less than 16GB
                 settings["context_size"] = 6
                 settings["context_limit"] = 2
-                settings["max_audio_length"] = 15000
+                settings["max_audio_length"] = 12000
+                settings["gemma_max_tokens"] = 50
                 print("⚠️ Limited GPU memory detected, reducing context size")
             elif gpu_mem > 32:  # More than 32GB
                 settings["context_size"] = 12
                 settings["context_limit"] = 8
                 settings["max_audio_length"] = 30000
+                settings["gemma_max_tokens"] = 150
         except:
             pass
     return settings
@@ -126,11 +225,39 @@ CONFIG = configure_settings()
 def show_progress(stop_event, message="Loading"):
     i = 0
     symbols = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]
-    while not stop_event.is_set():
-        print(f"\r{message} {symbols[i % len(symbols)]}", end="", flush=True)
-        i += 1
-        time.sleep(0.1)
-    print("\r" + " " * (len(message) + 2), end="", flush=True)  # Clear the line
+    try:
+        while not stop_event.is_set():
+            print(f"\r{message} {symbols[i % len(symbols)]}", end="", flush=True)
+            i += 1
+            time.sleep(0.1)
+        print("\r" + " " * (len(message) + 10), end="", flush=True)  # Clear the line with extra space
+    except:
+        # If something goes wrong, make sure we clear the line
+        print("\r" + " " * (len(message) + 10), end="", flush=True)
+
+# Memory cleanup utility
+def clean_memory():
+    if device == "cuda":
+        # More aggressive memory cleanup for CUDA
+        try:
+            torch.cuda.empty_cache()
+            gc.collect()
+            
+            # On some systems, we need a more aggressive approach
+            if platform.system() != 'Windows':  # This can hang on Windows
+                try:
+                    with torch.cuda.device(device):
+                        torch.cuda.ipc_collect()
+                except:
+                    pass
+        except Exception as e:
+            print(f"⚠️ Error during memory cleanup: {e}")
+    else:
+        # CPU cleanup
+        gc.collect()
+
+# Create working directory for model offloading
+os.makedirs("tmp_offload", exist_ok=True)
 
 # Download and load the CSM model with timeout
 print("🔄 Loading speech model...")
@@ -145,15 +272,20 @@ try:
     model_pattern = os.path.join(cache_dir, "**", "ckpt.pt")
     cached_model = None
     
-    import glob
-    for file in glob.glob(model_pattern, recursive=True):
-        if os.path.exists(file) and "sesame/csm-1b" in file:
-            cached_model = file
-            print(f"\rUsing cached model: {cached_model}", end="", flush=True)
-            break
+    # Safe glob search with timeout
+    def find_model():
+        import glob
+        for file in glob.glob(model_pattern, recursive=True):
+            if os.path.exists(file) and "sesame/csm-1b" in file:
+                return file
+        return None
     
-    # Set a timeout for model loading
-    model_queue = queue.Queue()
+    # Run with a timeout to prevent hanging on file system operations
+    cached_model, error = run_with_timeout(find_model, timeout=30)
+    if cached_model:
+        print(f"\rUsing cached model: {cached_model}", end="", flush=True)
+    
+    model_loading_error = None
     
     def load_model():
         try:
@@ -161,50 +293,41 @@ try:
                 model_path = cached_model
             else:
                 model_path = hf_hub_download(repo_id="sesame/csm-1b", filename="ckpt.pt")
+            
+            # Clean memory before loading model
+            clean_memory()
+            
             generator = load_csm_1b(model_path, device)
-            model_queue.put((generator, generator.sample_rate))
+            sample_rate = generator.sample_rate
+            return generator, sample_rate
         except Exception as e:
-            model_queue.put((e, None))
+            raise e
     
-    model_thread = threading.Thread(target=load_model)
-    model_thread.daemon = True
-    model_thread.start()
+    # Use platform-agnostic timeout wrapper
+    result, error = run_with_timeout(load_model, timeout=CONFIG["model_timeout"])
     
-    # Wait with timeout
-    model_thread.join(timeout=300)  # 5 minute timeout
+    if error:
+        raise error
     
-    if model_thread.is_alive():
-        progress_stop.set()
-        progress_thread.join()
-        print("🚨 Model loading timed out after 5 minutes")
-        print("🛑 Exiting as speech model is required")
-        exit(1)
-    
-    result = model_queue.get(block=False)
-    
-    if isinstance(result[0], Exception):
-        progress_stop.set()
-        progress_thread.join()
-        print(f"🚨 Failed to load speech model: {result[0]}")
-        print("🛑 Exiting as speech model is required")
-        exit(1)
+    if result is None:
+        raise TimeoutError(f"Model loading timed out after {CONFIG['model_timeout']} seconds")
     
     generator, sample_rate = result
     
     progress_stop.set()
-    progress_thread.join()
+    progress_thread.join(timeout=1)  # Add a timeout to join to prevent hanging
     print("✅ Speech model loaded successfully")
     
 except Exception as e:
     progress_stop.set()
-    progress_thread.join()
+    progress_thread.join(timeout=1)
     print(f"🚨 Failed to load speech model: {e}")
+    traceback.print_exc()
     print("🛑 Exiting as speech model is required")
     exit(1)
 
 # Set the Gemma 3 model
 text_model_name = "google/gemma-3-12b-it"
-model_type = "instruct"  # Gemma 3 uses instruction format
 
 # Load the Gemma 3 model
 print(f"🔄 Loading Gemma 3 12B...")
@@ -216,7 +339,6 @@ progress_thread.start()
 try:
     # Import specialized modules for efficient loading
     from transformers import BitsAndBytesConfig
-    import bitsandbytes as bnb
     
     # Determine optimal quantization based on available VRAM
     use_4bit = False
@@ -224,9 +346,16 @@ try:
     gpu_mem = 0
     
     if device == "cuda":
+        # Clean memory before checking
+        clean_memory()
+        
         gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
-        if gpu_mem < 24:  # Less than 24GB (full model size)
-            if gpu_mem < 12:  # Very limited memory
+        free_mem = gpu_mem - (torch.cuda.memory_allocated() / 1e9)
+        
+        print(f"📊 Available GPU memory: {free_mem:.2f}GB")
+        
+        if free_mem < 24:  # Less than 24GB (full model size)
+            if free_mem < 10:  # Very limited memory
                 use_4bit = True
                 print("⚠️ Using 4-bit quantization for Gemma 3 (very limited VRAM)")
             else:
@@ -248,13 +377,33 @@ try:
     else:
         quantization_config = None
     
-    # Create tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(text_model_name)
+    # Define function to load tokenizer
+    def load_tokenizer():
+        try:
+            # Create tokenizer with specific settings for Gemma 3
+            tokenizer = AutoTokenizer.from_pretrained(
+                text_model_name,
+                padding_side="left",
+                truncation_side="left"
+            )
+            return tokenizer
+        except Exception as e:
+            raise e
+    
+    # Load tokenizer with timeout
+    tokenizer, tokenizer_error = run_with_timeout(load_tokenizer, timeout=60)
+    
+    if tokenizer_error:
+        raise tokenizer_error
+    
+    if tokenizer is None:
+        raise TimeoutError("Tokenizer loading timed out")
     
     # Load the model with appropriate settings
     model_kwargs = {
         "device_map": "auto",
-        "low_cpu_mem_usage": True
+        "low_cpu_mem_usage": True,
+        "offload_folder": "tmp_offload"  # Offload to disk if needed
     }
     
     if quantization_config:
@@ -262,19 +411,38 @@ try:
     elif device == "cuda":
         model_kwargs["torch_dtype"] = torch.float16
     
-    # Load the model
-    text_model = AutoModelForCausalLM.from_pretrained(
-        text_model_name,
-        **model_kwargs
-    )
+    # Define function to load model
+    def load_text_model():
+        try:
+            # Clean memory before loading
+            clean_memory()
+            
+            model = AutoModelForCausalLM.from_pretrained(
+                text_model_name,
+                **model_kwargs
+            )
+            return model
+        except Exception as e:
+            raise e
+    
+    # Load model with timeout
+    text_model, model_error = run_with_timeout(load_text_model, timeout=CONFIG["model_timeout"])
+    
+    if model_error:
+        raise model_error
+        
+    if text_model is None:
+        raise TimeoutError(f"Gemma 3 model loading timed out after {CONFIG['model_timeout']} seconds")
+    
     use_external_llm = True
     
     progress_stop.set()
-    progress_thread.join()
+    progress_thread.join(timeout=1)
     print("✅ Gemma 3 12B loaded successfully")
+    
 except Exception as e:
     progress_stop.set()
-    progress_thread.join()
+    progress_thread.join(timeout=1)
     print(f"⚠️ Could not load Gemma 3 12B: {e}")
     traceback.print_exc()
     print("⚠️ Falling back to simple response generation")
@@ -290,63 +458,143 @@ AI_SPEAKER_ID = 1
 context = []  # For speech synthesis
 chat_history = []  # For text generation
 
+# Choose microphone
+def select_microphone():
+    try:
+        microphone_list = sr.Microphone.list_microphone_names()
+        if not microphone_list:
+            print("🚨 No microphones detected")
+            return None
+            
+        if len(microphone_list) == 1:
+            print(f"🎤 Using microphone: {microphone_list[0]}")
+            return 0
+            
+        print("📋 Available microphones:")
+        for idx, mic_name in enumerate(microphone_list):
+            print(f"{idx+1}. {mic_name}")
+        
+        # Use default microphone if there's no user input
+        if sys.stdin.isatty():  # Only prompt if running in a terminal
+            try:
+                choice = input("Select microphone (or press Enter for default): ")
+                if choice.strip():
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(microphone_list):
+                        print(f"🎤 Using microphone: {microphone_list[idx]}")
+                        return idx
+            except ValueError:
+                print("⚠️ Invalid selection, using default microphone")
+                
+        # Default to first microphone
+        print(f"🎤 Using default microphone: {microphone_list[0]}")
+        return 0
+    except Exception as e:
+        print(f"⚠️ Error selecting microphone: {e}")
+        print("🎤 Using default microphone")
+        return None
+
+# Select microphone for speech recognition
+mic_index = select_microphone()
+
 # Function to capture live microphone input
 def recognize_speech():
-    microphone_list = sr.Microphone.list_microphone_names()
-    if not microphone_list:
-        print("🚨 No microphones detected")
-        return None, None
-        
     recognizer = sr.Recognizer()
     try:
-        # Don't force the sample rate on the microphone - use default then resample
-        with sr.Microphone() as source:
-            print("\n🎤 Listening...")
-            recognizer.adjust_for_ambient_noise(source, duration=0.5)
-            
+        # Use the selected microphone or default
+        if mic_index is not None:
             try:
-                # Use timeout to prevent hanging
-                audio = recognizer.listen(source, timeout=10, phrase_time_limit=10)
-            except sr.WaitTimeoutError:
-                print("⚠️ Listening timed out - no speech detected")
-                return None, None
+                with sr.Microphone(device_index=mic_index) as source:
+                    print("\n🎤 Listening...")
+                    # Shorter adjustment duration to prevent long waits
+                    recognizer.adjust_for_ambient_noise(source, duration=0.3)
+                    
+                    try:
+                        # Use timeout to prevent hanging
+                        audio = recognizer.listen(source, timeout=10, phrase_time_limit=10)
+                    except sr.WaitTimeoutError:
+                        print("⚠️ Listening timed out - no speech detected")
+                        return None, None
+            except Exception as mic_error:
+                print(f"⚠️ Error with selected microphone: {mic_error}")
+                print("⚠️ Falling back to default microphone")
+                with sr.Microphone() as source:
+                    print("\n🎤 Listening...")
+                    recognizer.adjust_for_ambient_noise(source, duration=0.3)
+                    
+                    try:
+                        audio = recognizer.listen(source, timeout=10, phrase_time_limit=10)
+                    except sr.WaitTimeoutError:
+                        print("⚠️ Listening timed out - no speech detected")
+                        return None, None
+        else:
+            with sr.Microphone() as source:
+                print("\n🎤 Listening...")
+                recognizer.adjust_for_ambient_noise(source, duration=0.3)
+                
+                try:
+                    # Use timeout to prevent hanging
+                    audio = recognizer.listen(source, timeout=10, phrase_time_limit=10)
+                except sr.WaitTimeoutError:
+                    print("⚠️ Listening timed out - no speech detected")
+                    return None, None
             
         print("📝 Recognizing speech...")
-        # Try Google first (primary option - better accuracy but requires internet)
-        try:
-            text = recognizer.recognize_google(audio)
+        
+        # Try to get the audio with a timeout to prevent hanging
+        def recognize_with_google():
+            return recognizer.recognize_google(audio)
+            
+        text, error = run_with_timeout(recognize_with_google, timeout=10)
+        
+        if error:
+            if isinstance(error, sr.RequestError):
+                print("⚠️ Could not reach Google Speech Recognition API")
+                # Fall back to Sphinx only if Google fails
+                try:
+                    # Check if PocketSphinx is available
+                    if hasattr(recognizer, "recognize_sphinx"):
+                        text = recognizer.recognize_sphinx(audio)
+                        print(f"🗨️ You (Sphinx fallback): {text}")
+                        return text, audio
+                    else:
+                        print("⚠️ Sphinx recognition not available")
+                        return None, None
+                except (ImportError, AttributeError):
+                    print("⚠️ Sphinx recognition not available")
+                    return None, None
+                except Exception as e:
+                    print(f"⚠️ Sphinx recognition failed: {e}")
+                    return None, None
+            elif isinstance(error, sr.UnknownValueError):
+                print("⚠️ Could not understand audio")
+                return None, None
+            else:
+                print(f"⚠️ Recognition error: {error}")
+                return None, None
+        
+        if text:
             print(f"🗨️ You: {text}")
             return text, audio
-        except sr.RequestError:
-            print("⚠️ Could not reach Google Speech Recognition API")
-            # Fall back to Sphinx only if Google fails
-            try:
-                import speech_recognition as sr_check
-                # Only try Sphinx if it's actually available
-                text = recognizer.recognize_sphinx(audio)
-                print(f"🗨️ You (Sphinx fallback): {text}")
-                return text, audio
-            except (ImportError, AttributeError):
-                print("⚠️ Sphinx recognition not available")
-                return None, None
-            except Exception as e:
-                print(f"⚠️ Sphinx recognition failed: {e}")
-                return None, None
-        except sr.UnknownValueError:
-            print("⚠️ Could not understand audio")
+        else:
+            print("⚠️ No speech recognized")
             return None, None
+            
     except KeyboardInterrupt:
         raise KeyboardInterrupt("User interrupted speech recognition")
     except Exception as e:
         print(f"🚨 Error during speech recognition: {e}")
-        traceback.print_exc()
         return None, None
 
 # Function to convert speech_recognition audio to tensor
 def audio_to_tensor(audio_data):
     try:
-        if audio_data is None or len(audio_data.frame_data) == 0:
+        if audio_data is None:
             print("⚠️ Empty audio data")
+            return None
+            
+        if not hasattr(audio_data, 'frame_data') or len(audio_data.frame_data) == 0:
+            print("⚠️ No frame data in audio")
             return None
             
         # Convert audio data to numpy array
@@ -364,13 +612,13 @@ def audio_to_tensor(audio_data):
         audio_tensor = torch.tensor(audio_np)
         
         # Resample if needed and we know the rates
-        if hasattr(audio_data, 'sample_rate') and audio_data.sample_rate and sample_rate:
-            if audio_data.sample_rate != sample_rate:
-                audio_tensor = torchaudio.functional.resample(
-                    audio_tensor, 
-                    orig_freq=audio_data.sample_rate, 
-                    new_freq=sample_rate
-                )
+        sample_attr = getattr(audio_data, 'sample_rate', None)
+        if sample_attr and sample_rate and sample_attr != sample_rate:
+            audio_tensor = torchaudio.functional.resample(
+                audio_tensor, 
+                orig_freq=sample_attr, 
+                new_freq=sample_rate
+            )
         # Default sample rate if not specified
         elif hasattr(audio_data, 'sample_width') and audio_data.sample_width:
             # Typical default sample rates based on width
@@ -385,7 +633,6 @@ def audio_to_tensor(audio_data):
         return audio_tensor
     except Exception as e:
         print(f"⚠️ Error converting audio to tensor: {e}")
-        traceback.print_exc()
         return None
 
 # Function to play generated speech
@@ -415,28 +662,55 @@ def play_audio(audio_tensor):
             print("⚠️ Generated audio is nearly silent")
             return
         
-        # Normalize if too quiet
+        # Normalize audio properly for better playback
         max_amp = np.abs(audio_np).max()
-        if max_amp > 0 and max_amp < 0.1:
-            audio_np = audio_np * (0.5 / max_amp)
+        if max_amp > 0:
+            # Normalize to 0.9 to prevent clipping
+            target_loudness = 0.9
+            audio_np = audio_np * (target_loudness / max_amp)
             
-        # Check if sounddevice is initialized correctly
+        # Ensure audio is within bounds
+        audio_np = np.clip(audio_np, -1.0, 1.0)
+            
+        # Get current audio device info to ensure compatibility
         try:
-            sd.play(audio_np, samplerate=sample_rate)
+            audio_samplerate = sample_rate
             
-            # Use timeout for waiting to prevent hanging
-            timeout = min(len(audio_np) / sample_rate * 1.5, 45)  # 1.5x audio length or max 45 seconds
-            sd.wait(timeout=timeout)
-        except Exception as sd_error:
-            print(f"⚠️ Error during audio playback: {sd_error}")
-            # Try to reinitialize sound device
+            # Reset sounddevice to ensure clean state
+            sd.stop()
+            time.sleep(0.1)
+            
+            # Play audio with a careful error handling approach
             try:
-                sd.stop()
-                time.sleep(0.5)
-                sd.play(audio_np, samplerate=sample_rate)
-                sd.wait(timeout=timeout)
-            except:
-                print("⚠️ Could not recover audio playback")
+                sd.play(audio_np, samplerate=audio_samplerate)
+                
+                # Calculate timeout based on audio length
+                timeout = min(len(audio_np) / audio_samplerate * 1.5, 45)  # 1.5x audio length or max 45 seconds
+                
+                # Wait with a more careful approach
+                start_time = time.time()
+                while sd.get_stream().active and (time.time() - start_time) < timeout:
+                    time.sleep(0.1)
+                
+                # Stop if still playing after timeout
+                if sd.get_stream().active:
+                    sd.stop()
+            except Exception as sd_error:
+                print(f"⚠️ Error during audio playback: {sd_error}")
+                # Try a more direct approach as fallback
+                try:
+                    sd.stop()
+                    time.sleep(0.5)
+                    
+                    # Try with default settings
+                    sd.play(audio_np, samplerate=audio_samplerate)
+                    time.sleep(len(audio_np) / audio_samplerate)  # Simple waiting approach
+                    sd.stop()
+                except Exception as recovery_e:
+                    print(f"⚠️ Could not recover audio playback: {recovery_e}")
+        except Exception as e:
+            print(f"⚠️ Audio device error: {e}")
+            
     except Exception as e:
         print(f"⚠️ Error playing audio: {e}")
         # Force stop any ongoing playback
@@ -476,55 +750,76 @@ def clean_text_for_speech(text):
 
 # Format prompt specifically for Gemma 3
 def format_gemma3_prompt(history):
-    # Gemma 3 uses a specific instruction format
-    system_prompt = "You are a helpful, friendly AI assistant. Keep your responses conversational, natural and concise (1-3 sentences max). Speak as if you're having a real conversation. Avoid saying you're an AI."
+    # Specific prompt format for Gemma 3
+    system_prompt = "You are a helpful, friendly assistant giving spoken responses. Keep your responses conversational, natural and concise (1-3 sentences max). Avoid complex topics that would be difficult to understand when spoken. Respond in a way that sounds natural when read aloud."
     
-    # Format according to Gemma 3 chat template
-    formatted_messages = [{"role": "system", "content": system_prompt}]
+    # Handle the case where tokenizer is not available
+    if tokenizer is None:
+        prompt = system_prompt + "\n\n"
+        for message in history[-5:]:
+            if message["role"] == "user":
+                prompt += f"Human: {message['content']}\n"
+            else:
+                prompt += f"Assistant: {message['content']}\n"
+        prompt += "Assistant: "
+        return prompt
     
-    # Use limited recent history for efficiency
-    recent_history = history[-6:] if len(history) > 6 else history
+    # Convert chat history to the format expected by Gemma 3
+    messages = []
+    
+    # Add system message
+    messages.append({"role": "system", "content": system_prompt})
+    
+    # Use limited recent history (last 5 exchanges)
+    recent_history = history[-5:] if len(history) > 5 else history
     
     for message in recent_history:
-        if message["role"] == "user":
-            formatted_messages.append({"role": "user", "content": message["content"]})
-        else:
-            formatted_messages.append({"role": "model", "content": message["content"]})
+        role = "user" if message["role"] == "user" else "model"
+        messages.append({"role": role, "content": message["content"]})
     
-    # Convert to the format expected by the tokenizer
     try:
-        # If chat_template is available (preferred method)
+        # Check if the newer apply_chat_template method is available
         if hasattr(tokenizer, 'apply_chat_template'):
-            prompt = tokenizer.apply_chat_template(
-                formatted_messages, 
-                tokenize=False, 
-                add_generation_prompt=True
-            )
-        else:
-            # Manual formatting as fallback
-            prompt = ""
-            for msg in formatted_messages:
-                if msg["role"] == "system":
-                    prompt += f"<system>\n{msg['content']}\n</system>\n\n"
-                elif msg["role"] == "user":
-                    prompt += f"<user>\n{msg['content']}\n</user>\n\n"
-                elif msg["role"] == "model":
-                    prompt += f"<model>\n{msg['content']}\n</model>\n\n"
-            
-            prompt += "<model>\n"  # Add generation prompt
-            
+            try:
+                prompt = tokenizer.apply_chat_template(
+                    messages, 
+                    tokenize=False, 
+                    add_generation_prompt=True
+                )
+                return prompt
+            except Exception as e:
+                print(f"⚠️ Error applying chat template: {e}")
+                # Fall through to backup method
+        
+        # Manual implementation for Gemma 3 (backup)
+        # This matches Gemma 3's expected format as of early 2023
+        formatted_messages = []
+        
+        # System message
+        for message in messages:
+            if message["role"] == "system":
+                formatted_messages.append(f"<system>\n{message['content']}\n</system>")
+            elif message["role"] == "user":
+                formatted_messages.append(f"<user>\n{message['content']}\n</user>")
+            elif message["role"] == "model":
+                formatted_messages.append(f"<model>\n{message['content']}\n</model>")
+        
+        # Add generation prompt
+        formatted_messages.append("<model>")
+        
+        return "\n".join(formatted_messages)
+        
     except Exception as e:
-        print(f"⚠️ Error formatting prompt: {e}")
+        print(f"⚠️ Error formatting Gemma 3 prompt: {e}")
         # Ultra simple fallback
         prompt = system_prompt + "\n\n"
         for message in recent_history:
             if message["role"] == "user":
-                prompt += f"User: {message['content']}\n"
+                prompt += f"Human: {message['content']}\n"
             else:
                 prompt += f"Assistant: {message['content']}\n"
         prompt += "Assistant: "
-    
-    return prompt
+        return prompt
 
 # Function to generate dynamic AI responses using Gemma 3
 def get_ai_response(user_input):
@@ -549,56 +844,65 @@ def get_ai_response(user_input):
             prompt = format_gemma3_prompt(chat_history)
             
             # Generate response
-            inputs = tokenizer(prompt, return_tensors="pt")
+            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
             inputs = {k: v.to(text_model.device) for k, v in inputs.items()}
             
-            # Adjust generation parameters based on available memory
-            max_tokens = 100
-            if device == "cuda":
-                gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
-                if gpu_mem < 12:  # Limited memory
-                    max_tokens = 50
-            
             # Free memory before generation
-            if device == "cuda":
-                torch.cuda.empty_cache()
+            clean_memory()
             
-            # Generate with appropriate parameters
-            with torch.no_grad():
-                outputs = text_model.generate(
-                    inputs["input_ids"],
-                    max_new_tokens=max_tokens,
-                    do_sample=True,
-                    temperature=CONFIG["temperature"],
-                    top_p=0.9,
-                )
+            # Define generation function for timeout handling
+            def generate_text():
+                with torch.no_grad():
+                    outputs = text_model.generate(
+                        inputs["input_ids"],
+                        max_new_tokens=CONFIG["gemma_max_tokens"],
+                        do_sample=True,
+                        temperature=CONFIG["temperature"],
+                        top_p=0.9,
+                        repetition_penalty=1.1,
+                        no_repeat_ngram_size=3
+                    )
+                    
+                # Extract generated text
+                response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+                return response
             
-            # Extract generated text
-            response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+            # Generate with timeout
+            response, error = run_with_timeout(generate_text, timeout=60)
             
-            # Clean up response - remove any model/assistant tags or extra content
-            response = re.sub(r'</?model>|</?assistant>|^Assistant:|^Model:', '', response, flags=re.IGNORECASE)
-            
-            # Stop at end markers if present
-            stop_markers = ["</model>", "</assistant>", "<user>", "User:"]
-            for marker in stop_markers:
-                if marker in response:
-                    response = response.split(marker)[0]
-            
-            # Limit response length
-            if len(response) > CONFIG["max_response_length"]:
-                response = response[:CONFIG["max_response_length"]-3] + "..."
+            if error:
+                print(f"⚠️ Text generation timed out or failed: {error}")
+                response = get_fallback_response(user_input)
+            elif response is None:
+                print("⚠️ No response generated")
+                response = get_fallback_response(user_input)
+            else:
+                # Clean up response - remove any model/assistant tags or extra content
+                response = re.sub(r'</?model>|</?assistant>|^Assistant:|^Model:', '', response, flags=re.IGNORECASE)
                 
-            # Clean text for better speech synthesis
-            response = clean_text_for_speech(response)
+                # Stop at end markers if present
+                stop_markers = ["</model>", "</assistant>", "<user>", "User:", "Human:", "Human>", "<human>"]
+                for marker in stop_markers:
+                    if marker in response:
+                        response = response.split(marker)[0]
+                
+                # Limit response length
+                if len(response) > CONFIG["max_response_length"]:
+                    response = response[:CONFIG["max_response_length"]-3] + "..."
+                    
+                # Clean text for better speech synthesis
+                response = clean_text_for_speech(response)
                 
         except Exception as e:
             print(f"⚠️ Error generating response with Gemma 3: {e}")
-            traceback.print_exc()
             # Fall back to rule-based response
             response = get_fallback_response(user_input)
     else:
         response = get_fallback_response(user_input)
+    
+    # Ensure we have a valid response
+    if not response or len(response.strip()) == 0:
+        response = "I'm thinking about what you said. Can you tell me more?"
     
     # Add AI response to chat history
     chat_history.append({"role": "assistant", "content": response})
@@ -611,7 +915,7 @@ def get_ai_response(user_input):
 
 # Function for fallback responses when model isn't available
 def get_fallback_response(user_input):
-    user_input = user_input.lower()
+    user_input = user_input.lower() if user_input else ""
     
     # Remove common speech recognition errors/fillers
     user_input = re.sub(r'\bum\b|\buh\b|\blike\b|\byou know\b', '', user_input)
@@ -652,16 +956,53 @@ def cleanup():
     except:
         pass
     
-    # Clean up GPU memory if using CUDA
-    if device == "cuda":
+    # Clean up GPU memory
+    clean_memory()
+    
+    # Remove offload folder if it exists
+    if os.path.exists("tmp_offload"):
         try:
-            if text_model is not None:
-                del text_model
-            del generator
-            torch.cuda.empty_cache()
-            gc.collect()
+            import shutil
+            shutil.rmtree("tmp_offload")
         except:
             pass
+    
+    # Clean variables
+    global text_model, generator
+    try:
+        if 'text_model' in globals() and text_model is not None:
+            del text_model
+        if 'generator' in globals() and generator is not None:
+            del generator
+    except Exception as e:
+        print(f"⚠️ Error during cleanup: {e}")
+
+# Function to generate speech safely
+def generate_speech_safely(text, context, max_length_ms, temp):
+    try:
+        # Use the run_with_timeout function for safer speech generation
+        def generate_func():
+            return generator.generate(
+                text=text,
+                speaker=AI_SPEAKER_ID,
+                context=context,
+                max_audio_length_ms=max_length_ms,
+                temperature=temp,
+            )
+        
+        output, error = run_with_timeout(
+            generate_func, 
+            timeout=CONFIG["speech_timeout"]
+        )
+        
+        if error:
+            print(f"⚠️ Speech generation error: {error}")
+            return None
+            
+        return output
+    except Exception as e:
+        print(f"⚠️ Error in generate_speech_safely: {e}")
+        return None
 
 # Real-time conversation loop
 def live_conversation():
@@ -686,8 +1027,7 @@ def live_conversation():
     print(f"💡 Tip: Say 'exit', 'quit', or 'goodbye' to end the conversation")
     
     # Do a small cleanup before we start
-    if device == "cuda":
-        torch.cuda.empty_cache()
+    clean_memory()
     
     while conversation_active:
         try:
@@ -703,7 +1043,8 @@ def live_conversation():
             consecutive_errors = 0  # Reset error counter on success
             
             # Stop if user says "exit"
-            if any(word in user_input.lower() for word in ["exit", "quit", "stop", "end", "goodbye", "bye"]):
+            exit_words = ["exit", "quit", "stop", "end", "goodbye", "bye"]
+            if any(word in user_input.lower() for word in exit_words):
                 print("👋 Exiting chat...")
                 break
             
@@ -730,8 +1071,7 @@ def live_conversation():
             print("💭 Thinking with Gemma 3...")
             
             # Free memory before generation
-            if device == "cuda":
-                torch.cuda.empty_cache()
+            clean_memory()
                 
             ai_text_response = get_ai_response(user_input)
             print(f"💬 AI: {ai_text_response}")
@@ -745,8 +1085,7 @@ def live_conversation():
                     total_mem = torch.cuda.get_device_properties(0).total_memory
                     if current_mem > 0.8 * total_mem:  # Using 80% threshold
                         print("⚠️ Low GPU memory, clearing cache")
-                        torch.cuda.empty_cache()
-                        gc.collect()
+                        clean_memory()
                 
                 # Determine what context to use
                 speech_context = context
@@ -754,24 +1093,25 @@ def live_conversation():
                     # Use only recent context to avoid memory issues
                     speech_context = context[-2:]
                 
-                # Use a reasonable maximum audio length
-                audio_output = generator.generate(
+                # Generate speech safely with timeout handling
+                audio_output = generate_speech_safely(
                     text=ai_text_response,
-                    speaker=AI_SPEAKER_ID,
                     context=speech_context,
-                    max_audio_length_ms=CONFIG["max_audio_length"],
-                    temperature=CONFIG["temperature"],
+                    max_length_ms=CONFIG["max_audio_length"],
+                    temp=CONFIG["temperature"]
                 )
                 
-                # Play response
-                play_audio(audio_output)
-                
-                # Add AI response to context
-                context.append(Segment(text=ai_text_response, speaker=AI_SPEAKER_ID, audio=audio_output))
+                # Play response if we have valid audio
+                if audio_output is not None:
+                    play_audio(audio_output)
+                    # Add AI response to context
+                    context.append(Segment(text=ai_text_response, speaker=AI_SPEAKER_ID, audio=audio_output))
+                else:
+                    # Speech generation failed, enter recovery
+                    raise Exception("Failed to generate speech")
                 
             except Exception as e:
                 print(f"🚨 Error generating speech: {e}")
-                traceback.print_exc()
                 
                 # Try a shorter response with minimal context
                 try:
@@ -790,22 +1130,40 @@ def live_conversation():
                     if not recovery_context:
                         recovery_context = [Segment(text="Hello", speaker=USER_SPEAKER_ID, audio=None)]
                     
-                    audio_output = generator.generate(
+                    # Clean memory again
+                    clean_memory()
+                    
+                    # Try with minimal settings
+                    audio_output = generate_speech_safely(
                         text=short_response,
-                        speaker=AI_SPEAKER_ID,
                         context=recovery_context,
-                        max_audio_length_ms=CONFIG["recovery_audio_ms"],
-                        temperature=CONFIG["fallback_temp"],
+                        max_length_ms=CONFIG["recovery_audio_ms"],
+                        temp=CONFIG["fallback_temp"]
                     )
-                    play_audio(audio_output)
-                    context.append(Segment(text=short_response, speaker=AI_SPEAKER_ID, audio=audio_output))
+                    
+                    # Ensure audio is valid
+                    if audio_output is not None and isinstance(audio_output, torch.Tensor) and audio_output.numel() > 0:
+                        play_audio(audio_output)
+                        context.append(Segment(text=short_response, speaker=AI_SPEAKER_ID, audio=audio_output))
+                    else:
+                        print("⚠️ Generated recovery audio is invalid")
+                        
                 except Exception as recovery_e:
                     print(f"🚨 Could not generate recovery speech: {recovery_e}")
+                    
+                # Always add the response to context for conversation flow, even if audio failed
+                if ai_text_response and ai_text_response.strip():
+                    # Add to context without audio
+                    try:
+                        context.append(Segment(text=ai_text_response, speaker=AI_SPEAKER_ID, audio=None))
+                        print("📝 Added response to context without audio")
+                    except Exception as ctx_e:
+                        print(f"⚠️ Error adding to context: {ctx_e}")
+                        
                 continue
             
             # Clean up after each turn
-            if device == "cuda":
-                torch.cuda.empty_cache()
+            clean_memory()
                 
         except KeyboardInterrupt:
             print("\n👋 Exiting chat...")
