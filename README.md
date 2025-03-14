@@ -1,3 +1,8 @@
+The script I'm working on is SesameConverse.py. It's currently a work in progress, but keep an eye on the repo for updates, I'll update the releases section once it's functional. Hopefully will have it working by later tonight or tomorrow. The default model for text generation is going to be Gemma 3 12B.
+
+----------------------------------------------------
+
+
 # CSM
 
 **2025/03/13** - We are releasing the 1B CSM variant. The checkpoint is [hosted on HuggingFace](https://huggingface.co/sesame/csm_1b).
