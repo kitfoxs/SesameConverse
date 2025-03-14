@@ -1,3 +1,13 @@
+# STATUS UPDATE
+
+I got Gemma 3 to build without errors before I went to sleep finally, replacing the built in Llama 1B model. That's as far as I got, but Gemma 3 should be swapped in correctly now. All Gemma 3 values (temp, etc) are placeholders, I'll leave tweaking that to find the best settings to you guys.
+
+I've uploaded all the updated relevant files to the repo, you should be able to go from here if you don't want to wait for me to put up step by step instructions for how I got to where I am.
+
+Main points are: Swap Models.py with mine, . You also need my generator.py. Lastly, after you install all the build requirements in requirements.txt (and others I still need to update it with), you must switch the "_model_builders.py" in the folder in the repo with the one that is created after torchtune is installed via the "pip install -r requirements.txt" command. Launch the model via "python SesameConverse.py" once all dependencies are installed and all 3 files have been replaced with mine (generator.py, models.py, _model_builders.py)
+
+------------------------------------------------------------------
+
 The script I'm working on is SesameConverse.py. It's currently a work in progress, but keep an eye on the repo for updates, I'll update the releases section once it's functional. Hopefully will have it working soon. The default model for text generation is going to be Gemma 3 12B. This will allow Sesame to have real-time conversations like the demo.
 
 # Hugging Face Access Tokens
