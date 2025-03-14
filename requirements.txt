@@ -10,3 +10,7 @@ torchaudio==2.4.0+cu121
 torchvision==0.17.0+cu121 
 sounddevice==0.4.7
 SpeechRecognition==3.10.0
+wheel==0.42.0
+setuptools==68.0.0
+ninja==1.11.1
+triton-windows==2.0.0
