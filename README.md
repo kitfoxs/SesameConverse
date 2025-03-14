@@ -1,5 +1,17 @@
 The script I'm working on is SesameConverse.py. It's currently a work in progress, but keep an eye on the repo for updates, I'll update the releases section once it's functional. Hopefully will have it working by later tonight or tomorrow. The default model for text generation is going to be Gemma 3 12B. This will allow Sesame to have real-time conversations like the demo.
 
+# Hugging Face Access Tokens
+
+You must generate an access token here:
+
+https://huggingface.co/settings/tokens
+
+and use this command in the terminal:
+
+"huggingface-cli login"
+
+Then input your access token.
+
 ----------------------------------------------------
 
 
