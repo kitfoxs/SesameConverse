@@ -20,6 +20,9 @@ warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
+# Define a global variable for graceful shutdown
+shutdown_requested = False
+
 # Cross-platform timeout handler
 class TimeoutHandler:
     def __init__(self, seconds=60, error_message='Operation timed out'):
@@ -46,6 +49,7 @@ def run_with_timeout(func, args=(), kwargs={}, timeout=60):
     """Run a function with a timeout, works on all platforms."""
     result_queue = queue.Queue()
     error_ref = []
+    thread_finished = threading.Event()
     
     def wrapper():
         try:
@@ -54,17 +58,24 @@ def run_with_timeout(func, args=(), kwargs={}, timeout=60):
         except Exception as e:
             error_ref.append(e)
             result_queue.put(None)
+        finally:
+            thread_finished.set()
     
     thread = threading.Thread(target=wrapper)
     thread.daemon = True
     thread.start()
+    
+    # Wait for timeout or completion
     thread.join(timeout=timeout)
     
-    if thread.is_alive():
+    # Check if thread is still running after timeout
+    if not thread_finished.is_set():
         return None, TimeoutError(f"Function timed out after {timeout} seconds")
     
+    # If thread finished but result not in queue yet, wait a bit more
     try:
-        result = result_queue.get(block=False)
+        # Give a small extra time for result to appear in queue
+        result = result_queue.get(block=True, timeout=1.0)
         if error_ref:
             return None, error_ref[0]
         return result, None
@@ -110,8 +121,24 @@ def check_requirements():
     
     return sr, hf_hub_download, AutoModelForCausalLM, AutoTokenizer
 
+# Global exception handler to prevent crashes
+def global_exception_handler(exctype, value, tb):
+    global shutdown_requested
+    print(f"🚨 Uncaught exception: {value}")
+    traceback.print_exception(exctype, value, tb)
+    shutdown_requested = True
+    # Call the original exception handler
+    sys.__excepthook__(exctype, value, tb)
+
+# Set up global exception handler
+sys.excepthook = global_exception_handler
+
 # Get required packages
-sr, hf_hub_download, AutoModelForCausalLM, AutoTokenizer = check_requirements()
+try:
+    sr, hf_hub_download, AutoModelForCausalLM, AutoTokenizer = check_requirements()
+except Exception as e:
+    print(f"🚨 Fatal error during package check: {e}")
+    sys.exit(1)
 
 # Check for CUDA availability and compatibility
 device = "cpu"
@@ -177,7 +204,8 @@ def configure_settings():
         "recovery_audio_ms": 3000,  # Short audio duration for recovery
         "gemma_max_tokens": 100,  # Default max tokens for Gemma responses
         "model_timeout": 300,   # Timeout for model loading (seconds)
-        "speech_timeout": 60    # Timeout for speech generation (seconds)
+        "speech_timeout": 60,   # Timeout for speech generation (seconds)
+        "silence_threshold": 0.005  # Threshold for detecting silent audio
     }
     
     # Platform-specific optimizations
@@ -215,8 +243,8 @@ def configure_settings():
                 settings["context_limit"] = 8
                 settings["max_audio_length"] = 30000
                 settings["gemma_max_tokens"] = 150
-        except:
-            pass
+        except Exception as e:
+            print(f"⚠️ Could not check GPU memory: {e}")
     return settings
 
 CONFIG = configure_settings()
@@ -226,13 +254,14 @@ def show_progress(stop_event, message="Loading"):
     i = 0
     symbols = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]
     try:
-        while not stop_event.is_set():
+        while not stop_event.is_set() and not shutdown_requested:
             print(f"\r{message} {symbols[i % len(symbols)]}", end="", flush=True)
             i += 1
             time.sleep(0.1)
-        print("\r" + " " * (len(message) + 10), end="", flush=True)  # Clear the line with extra space
     except:
-        # If something goes wrong, make sure we clear the line
+        pass
+    finally:
+        # Always clean up the line
         print("\r" + " " * (len(message) + 10), end="", flush=True)
 
 # Memory cleanup utility
@@ -248,8 +277,8 @@ def clean_memory():
                 try:
                     with torch.cuda.device(device):
                         torch.cuda.ipc_collect()
-                except:
-                    pass
+                except Exception as e:
+                    pass  # Silently ignore IPC collection failures
         except Exception as e:
             print(f"⚠️ Error during memory cleanup: {e}")
     else:
@@ -257,7 +286,11 @@ def clean_memory():
         gc.collect()
 
 # Create working directory for model offloading
-os.makedirs("tmp_offload", exist_ok=True)
+try:
+    os.makedirs("tmp_offload", exist_ok=True)
+except Exception as e:
+    print(f"⚠️ Cannot create offload directory: {e}")
+    # Continue anyway, model loading will fall back to other mechanisms
 
 # Download and load the CSM model with timeout
 print("🔄 Loading speech model...")
@@ -274,18 +307,19 @@ try:
     
     # Safe glob search with timeout
     def find_model():
-        import glob
-        for file in glob.glob(model_pattern, recursive=True):
-            if os.path.exists(file) and "sesame/csm-1b" in file:
-                return file
+        try:
+            import glob
+            for file in glob.glob(model_pattern, recursive=True):
+                if os.path.exists(file) and "sesame/csm-1b" in file:
+                    return file
+        except Exception as e:
+            print(f"⚠️ Error searching for model cache: {e}")
         return None
     
     # Run with a timeout to prevent hanging on file system operations
     cached_model, error = run_with_timeout(find_model, timeout=30)
     if cached_model:
         print(f"\rUsing cached model: {cached_model}", end="", flush=True)
-    
-    model_loading_error = None
     
     def load_model():
         try:
@@ -298,7 +332,13 @@ try:
             clean_memory()
             
             generator = load_csm_1b(model_path, device)
-            sample_rate = generator.sample_rate
+            if hasattr(generator, 'sample_rate'):
+                sample_rate = generator.sample_rate
+            else:
+                # Default sample rate if not available from generator
+                sample_rate = 24000
+                print("⚠️ Using default sample rate 24000 Hz")
+            
             return generator, sample_rate
         except Exception as e:
             raise e
@@ -314,17 +354,22 @@ try:
     
     generator, sample_rate = result
     
+    # Verify generator is valid
+    if generator is None:
+        raise ValueError("Speech model was loaded but returned None")
+    
     progress_stop.set()
-    progress_thread.join(timeout=1)  # Add a timeout to join to prevent hanging
+    # Join with timeout to avoid hanging
+    progress_thread.join(timeout=2)
     print("✅ Speech model loaded successfully")
     
 except Exception as e:
     progress_stop.set()
-    progress_thread.join(timeout=1)
+    progress_thread.join(timeout=2)
     print(f"🚨 Failed to load speech model: {e}")
     traceback.print_exc()
     print("🛑 Exiting as speech model is required")
-    exit(1)
+    sys.exit(1)
 
 # Set the Gemma 3 model
 text_model_name = "google/gemma-3-12b-it"
@@ -437,12 +482,12 @@ try:
     use_external_llm = True
     
     progress_stop.set()
-    progress_thread.join(timeout=1)
+    progress_thread.join(timeout=2)
     print("✅ Gemma 3 12B loaded successfully")
     
 except Exception as e:
     progress_stop.set()
-    progress_thread.join(timeout=1)
+    progress_thread.join(timeout=2)
     print(f"⚠️ Could not load Gemma 3 12B: {e}")
     traceback.print_exc()
     print("⚠️ Falling back to simple response generation")
@@ -457,6 +502,58 @@ AI_SPEAKER_ID = 1
 # Store conversation history
 context = []  # For speech synthesis
 chat_history = []  # For text generation
+
+# Safe interface to sounddevice
+class AudioPlayer:
+    def __init__(self, sample_rate):
+        self.sample_rate = sample_rate
+        self.active_stream = None
+        self.lock = threading.Lock()
+    
+    def play(self, audio_array, samplerate=None):
+        with self.lock:
+            # Stop any existing playback
+            self.stop()
+            
+            # Use provided sample rate or default
+            sr = samplerate if samplerate is not None else self.sample_rate
+            
+            # Start playback
+            try:
+                self.active_stream = sd.play(audio_array, samplerate=sr)
+            except Exception as e:
+                print(f"⚠️ Audio playback error: {e}")
+                return False
+        return True
+    
+    def stop(self):
+        with self.lock:
+            try:
+                sd.stop()
+                if self.active_stream is not None:
+                    self.active_stream = None
+            except Exception as e:
+                print(f"⚠️ Error stopping audio: {e}")
+    
+    def wait(self, timeout=None):
+        try:
+            if timeout is not None:
+                # Wait with timeout
+                start_time = time.time()
+                while sd.get_status().active and (time.time() - start_time) < timeout:
+                    time.sleep(0.1)
+                
+                # Force stop if still playing
+                if sd.get_status().active:
+                    self.stop()
+            else:
+                sd.wait()
+        except Exception as e:
+            print(f"⚠️ Error waiting for audio: {e}")
+            self.stop()
+
+# Initialize audio player
+audio_player = AudioPlayer(sample_rate)
 
 # Choose microphone
 def select_microphone():
@@ -518,26 +615,34 @@ def recognize_speech():
             except Exception as mic_error:
                 print(f"⚠️ Error with selected microphone: {mic_error}")
                 print("⚠️ Falling back to default microphone")
+                try:
+                    with sr.Microphone() as source:
+                        print("\n🎤 Listening with default microphone...")
+                        recognizer.adjust_for_ambient_noise(source, duration=0.3)
+                        
+                        try:
+                            audio = recognizer.listen(source, timeout=10, phrase_time_limit=10)
+                        except sr.WaitTimeoutError:
+                            print("⚠️ Listening timed out - no speech detected")
+                            return None, None
+                except Exception as e:
+                    print(f"⚠️ Error with default microphone: {e}")
+                    return None, None
+        else:
+            try:
                 with sr.Microphone() as source:
                     print("\n🎤 Listening...")
                     recognizer.adjust_for_ambient_noise(source, duration=0.3)
                     
                     try:
+                        # Use timeout to prevent hanging
                         audio = recognizer.listen(source, timeout=10, phrase_time_limit=10)
                     except sr.WaitTimeoutError:
                         print("⚠️ Listening timed out - no speech detected")
                         return None, None
-        else:
-            with sr.Microphone() as source:
-                print("\n🎤 Listening...")
-                recognizer.adjust_for_ambient_noise(source, duration=0.3)
-                
-                try:
-                    # Use timeout to prevent hanging
-                    audio = recognizer.listen(source, timeout=10, phrase_time_limit=10)
-                except sr.WaitTimeoutError:
-                    print("⚠️ Listening timed out - no speech detected")
-                    return None, None
+            except Exception as e:
+                print(f"⚠️ Error with microphone: {e}")
+                return None, None
             
         print("📝 Recognizing speech...")
         
@@ -548,7 +653,7 @@ def recognize_speech():
         text, error = run_with_timeout(recognize_with_google, timeout=10)
         
         if error:
-            if isinstance(error, sr.RequestError):
+            if isinstance(error, sr.RequestError) or "RequestError" in str(error):
                 print("⚠️ Could not reach Google Speech Recognition API")
                 # Fall back to Sphinx only if Google fails
                 try:
@@ -566,7 +671,7 @@ def recognize_speech():
                 except Exception as e:
                     print(f"⚠️ Sphinx recognition failed: {e}")
                     return None, None
-            elif isinstance(error, sr.UnknownValueError):
+            elif isinstance(error, sr.UnknownValueError) or "UnknownValueError" in str(error):
                 print("⚠️ Could not understand audio")
                 return None, None
             else:
@@ -614,21 +719,29 @@ def audio_to_tensor(audio_data):
         # Resample if needed and we know the rates
         sample_attr = getattr(audio_data, 'sample_rate', None)
         if sample_attr and sample_rate and sample_attr != sample_rate:
-            audio_tensor = torchaudio.functional.resample(
-                audio_tensor, 
-                orig_freq=sample_attr, 
-                new_freq=sample_rate
-            )
+            try:
+                audio_tensor = torchaudio.functional.resample(
+                    audio_tensor, 
+                    orig_freq=sample_attr, 
+                    new_freq=sample_rate
+                )
+            except Exception as e:
+                print(f"⚠️ Resampling error: {e}")
+                # Return original tensor if resampling fails
         # Default sample rate if not specified
         elif hasattr(audio_data, 'sample_width') and audio_data.sample_width:
             # Typical default sample rates based on width
             default_rate = 16000 if audio_data.sample_width <= 2 else 44100
             if default_rate != sample_rate:
-                audio_tensor = torchaudio.functional.resample(
-                    audio_tensor, 
-                    orig_freq=default_rate, 
-                    new_freq=sample_rate
-                )
+                try:
+                    audio_tensor = torchaudio.functional.resample(
+                        audio_tensor, 
+                        orig_freq=default_rate, 
+                        new_freq=sample_rate
+                    )
+                except Exception as e:
+                    print(f"⚠️ Default resampling error: {e}")
+                    # Return original tensor if resampling fails
         
         return audio_tensor
     except Exception as e:
@@ -658,12 +771,12 @@ def play_audio(audio_tensor):
         audio_np = audio_tensor.cpu().numpy()
         
         # Check if audio is silent (very low amplitude)
-        if np.abs(audio_np).max() < 0.01:
-            print("⚠️ Generated audio is nearly silent")
+        max_amp = np.abs(audio_np).max()
+        if max_amp < CONFIG["silence_threshold"]:
+            print(f"⚠️ Generated audio is too quiet (max amplitude: {max_amp})")
             return
         
         # Normalize audio properly for better playback
-        max_amp = np.abs(audio_np).max()
         if max_amp > 0:
             # Normalize to 0.9 to prevent clipping
             target_loudness = 0.9
@@ -672,52 +785,16 @@ def play_audio(audio_tensor):
         # Ensure audio is within bounds
         audio_np = np.clip(audio_np, -1.0, 1.0)
             
-        # Get current audio device info to ensure compatibility
-        try:
-            audio_samplerate = sample_rate
-            
-            # Reset sounddevice to ensure clean state
-            sd.stop()
-            time.sleep(0.1)
-            
-            # Play audio with a careful error handling approach
-            try:
-                sd.play(audio_np, samplerate=audio_samplerate)
-                
-                # Calculate timeout based on audio length
-                timeout = min(len(audio_np) / audio_samplerate * 1.5, 45)  # 1.5x audio length or max 45 seconds
-                
-                # Wait with a more careful approach
-                start_time = time.time()
-                while sd.get_stream().active and (time.time() - start_time) < timeout:
-                    time.sleep(0.1)
-                
-                # Stop if still playing after timeout
-                if sd.get_stream().active:
-                    sd.stop()
-            except Exception as sd_error:
-                print(f"⚠️ Error during audio playback: {sd_error}")
-                # Try a more direct approach as fallback
-                try:
-                    sd.stop()
-                    time.sleep(0.5)
-                    
-                    # Try with default settings
-                    sd.play(audio_np, samplerate=audio_samplerate)
-                    time.sleep(len(audio_np) / audio_samplerate)  # Simple waiting approach
-                    sd.stop()
-                except Exception as recovery_e:
-                    print(f"⚠️ Could not recover audio playback: {recovery_e}")
-        except Exception as e:
-            print(f"⚠️ Audio device error: {e}")
+        # Play audio with global audio player
+        if audio_player.play(audio_np, samplerate=sample_rate):
+            # Calculate timeout based on audio length
+            timeout = min(len(audio_np) / sample_rate * 1.5, 45)  # 1.5x audio length or max 45 seconds
+            audio_player.wait(timeout=timeout)
             
     except Exception as e:
         print(f"⚠️ Error playing audio: {e}")
         # Force stop any ongoing playback
-        try:
-            sd.stop()
-        except:
-            pass
+        audio_player.stop()
 
 # Clean text for better speech synthesis
 def clean_text_for_speech(text):
@@ -952,7 +1029,7 @@ def cleanup():
     
     # Stop any ongoing audio playback
     try:
-        sd.stop()
+        audio_player.stop()
     except:
         pass
     
@@ -964,8 +1041,8 @@ def cleanup():
         try:
             import shutil
             shutil.rmtree("tmp_offload")
-        except:
-            pass
+        except Exception as e:
+            print(f"⚠️ Error removing offload folder: {e}")
     
     # Clean variables
     global text_model, generator
@@ -979,13 +1056,17 @@ def cleanup():
 
 # Function to generate speech safely
 def generate_speech_safely(text, context, max_length_ms, temp):
+    if generator is None:
+        print("⚠️ Speech generator is not available")
+        return None
+        
     try:
         # Use the run_with_timeout function for safer speech generation
         def generate_func():
             return generator.generate(
                 text=text,
                 speaker=AI_SPEAKER_ID,
-                context=context,
+                context=context if context else [],  # Ensure context is not None
                 max_audio_length_ms=max_length_ms,
                 temperature=temp,
             )
@@ -999,6 +1080,16 @@ def generate_speech_safely(text, context, max_length_ms, temp):
             print(f"⚠️ Speech generation error: {error}")
             return None
             
+        # Verify output is valid
+        if output is None:
+            print("⚠️ Speech generation returned None")
+            return None
+            
+        # Check if the output has any NaN values
+        if isinstance(output, torch.Tensor) and torch.isnan(output).any():
+            print("⚠️ Speech output contains NaN values")
+            return None
+            
         return output
     except Exception as e:
         print(f"⚠️ Error in generate_speech_safely: {e}")
@@ -1006,7 +1097,7 @@ def generate_speech_safely(text, context, max_length_ms, temp):
 
 # Real-time conversation loop
 def live_conversation():
-    global context
+    global context, shutdown_requested
     print("🎙️ Live Voice AI is running...")
     print("Say 'exit' or 'quit' to end the conversation.")
     time.sleep(1)
@@ -1029,7 +1120,11 @@ def live_conversation():
     # Do a small cleanup before we start
     clean_memory()
     
-    while conversation_active:
+    # Initialize context if empty
+    if context is None:
+        context = []
+    
+    while conversation_active and not shutdown_requested:
         try:
             # Capture voice input
             user_input, audio_data = recognize_speech()
@@ -1060,12 +1155,18 @@ def live_conversation():
             # Add user input to context
             try:
                 if user_input and user_input.strip():  # Verify we have real text
-                    context.append(Segment(text=user_input, speaker=USER_SPEAKER_ID, audio=user_audio))
+                    new_segment = Segment(text=user_input, speaker=USER_SPEAKER_ID, audio=user_audio)
+                    context.append(new_segment)
             except Exception as e:
                 print(f"⚠️ Error adding user segment to context: {e}")
                 # Create a new context if needed
-                if not context:
-                    context = [Segment(text=user_input, speaker=USER_SPEAKER_ID, audio=None)]
+                try:
+                    if not context:
+                        context = [Segment(text=user_input, speaker=USER_SPEAKER_ID, audio=None)]
+                except Exception as ctx_e:
+                    print(f"⚠️ Cannot create context: {ctx_e}")
+                    # Last resort: empty context
+                    context = []
             
             # Generate AI text response
             print("💭 Thinking with Gemma 3...")
@@ -1083,15 +1184,26 @@ def live_conversation():
                 if device == "cuda":
                     current_mem = torch.cuda.memory_allocated()
                     total_mem = torch.cuda.get_device_properties(0).total_memory
-                    if current_mem > 0.8 * total_mem:  # Using 80% threshold
+                    if current_mem > 0.7 * total_mem:  # Using 70% threshold (reduced from 80%)
                         print("⚠️ Low GPU memory, clearing cache")
                         clean_memory()
                 
-                # Determine what context to use
-                speech_context = context
-                if len(context) > 2:
+                # Safety check for context
+                if context is None or not isinstance(context, list):
+                    print("⚠️ Context is invalid, resetting")
+                    context = []
+                
+                # Use safe context
+                speech_context = []
+                try:
                     # Use only recent context to avoid memory issues
-                    speech_context = context[-2:]
+                    if len(context) > 0:
+                        if len(context) > 2:
+                            speech_context = context[-2:]
+                        else:
+                            speech_context = context.copy()
+                except Exception as e:
+                    print(f"⚠️ Error copying context: {e}")
                 
                 # Generate speech safely with timeout handling
                 audio_output = generate_speech_safely(
@@ -1102,13 +1214,16 @@ def live_conversation():
                 )
                 
                 # Play response if we have valid audio
-                if audio_output is not None:
+                if audio_output is not None and isinstance(audio_output, torch.Tensor) and audio_output.numel() > 0:
                     play_audio(audio_output)
                     # Add AI response to context
-                    context.append(Segment(text=ai_text_response, speaker=AI_SPEAKER_ID, audio=audio_output))
+                    try:
+                        context.append(Segment(text=ai_text_response, speaker=AI_SPEAKER_ID, audio=audio_output))
+                    except Exception as e:
+                        print(f"⚠️ Error adding AI response to context: {e}")
                 else:
                     # Speech generation failed, enter recovery
-                    raise Exception("Failed to generate speech")
+                    raise ValueError("Failed to generate valid speech output")
                 
             except Exception as e:
                 print(f"🚨 Error generating speech: {e}")
@@ -1120,23 +1235,14 @@ def live_conversation():
                     
                     # Create minimal context for recovery
                     recovery_context = []
-                    if context and len(context) > 0:
-                        # Get just the last user message
-                        for seg in reversed(context):
-                            if seg.speaker == USER_SPEAKER_ID:
-                                recovery_context = [Segment(text=seg.text, speaker=USER_SPEAKER_ID, audio=None)]
-                                break
-                    
-                    if not recovery_context:
-                        recovery_context = [Segment(text="Hello", speaker=USER_SPEAKER_ID, audio=None)]
                     
                     # Clean memory again
                     clean_memory()
                     
-                    # Try with minimal settings
+                    # Try with minimal settings and empty context
                     audio_output = generate_speech_safely(
                         text=short_response,
-                        context=recovery_context,
+                        context=[],  # Use empty context for maximum reliability
                         max_length_ms=CONFIG["recovery_audio_ms"],
                         temp=CONFIG["fallback_temp"]
                     )
@@ -1144,7 +1250,10 @@ def live_conversation():
                     # Ensure audio is valid
                     if audio_output is not None and isinstance(audio_output, torch.Tensor) and audio_output.numel() > 0:
                         play_audio(audio_output)
-                        context.append(Segment(text=short_response, speaker=AI_SPEAKER_ID, audio=audio_output))
+                        try:
+                            context.append(Segment(text=short_response, speaker=AI_SPEAKER_ID, audio=audio_output))
+                        except Exception as ctx_e:
+                            print(f"⚠️ Error adding recovery response to context: {ctx_e}")
                     else:
                         print("⚠️ Generated recovery audio is invalid")
                         
@@ -1177,6 +1286,17 @@ def live_conversation():
                 conversation_active = False
             # Brief pause to prevent rapid-fire errors
             time.sleep(1)
+
+# Handle shutdown signals
+def signal_handler(sig, frame):
+    global shutdown_requested
+    print("\n👋 Shutdown signal received, exiting...")
+    shutdown_requested = True
+
+# Register signal handlers if on a platform that supports them
+if platform.system() != 'Windows':
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
 if __name__ == "__main__":
     try:
