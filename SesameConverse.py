@@ -14,6 +14,7 @@ import traceback
 import platform
 import signal
 from generator import load_csm_1b, Segment
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Suppress unnecessary warnings
 warnings.filterwarnings("ignore", category=UserWarning)
