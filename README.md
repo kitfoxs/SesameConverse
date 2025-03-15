@@ -1,3 +1,5 @@
+PRs welcome!
+
 # STATUS UPDATE
 
 I got Gemma 3 to build without errors before I went to sleep finally, replacing the built in Llama 1B model. That's as far as I got, but Gemma 3 should be swapped in correctly now. All Gemma 3 values (temp, etc) are placeholders, I'll leave tweaking that to find the best settings to you guys.
