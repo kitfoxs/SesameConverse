@@ -205,7 +205,7 @@ def configure_settings():
         "recovery_audio_ms": 3000,  # Short audio duration for recovery
         "gemma_max_tokens": 100,  # Default max tokens for Gemma responses
         "model_timeout": 300,   # Timeout for model loading (seconds)
-        "speech_timeout": 60,   # Timeout for speech generation (seconds)
+        "speech_timeout": 180,  # Timeout for speech generation (seconds) - Increased from 60 to 180
         "silence_threshold": 0.005  # Threshold for detecting silent audio
     }
     
@@ -213,7 +213,7 @@ def configure_settings():
     if platform.system() == 'Windows':
         # Windows often needs larger timeouts
         settings["model_timeout"] = 400
-        settings["speech_timeout"] = 80
+        settings["speech_timeout"] = 220  # Increased from 80 to 220
     
     # Adjust settings for low-memory devices
     if device == "cpu":
@@ -302,10 +302,20 @@ progress_thread.start()
 
 try:
     # Check for cached model first
-    cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+    hf_home = os.environ.get("HF_HOME")
+    if not hf_home:
+        # Try to get the cache directory through the huggingface_hub if available
+        try:
+            from huggingface_hub import HfFolder
+            hf_home = HfFolder.get_cache_dir()
+        except (ImportError, AttributeError):
+            # Fall back to default location if huggingface_hub can't be used
+            hf_home = os.path.expanduser("~/.cache/huggingface")
+
+    cache_dir = os.path.join(hf_home, "hub")
     model_pattern = os.path.join(cache_dir, "**", "ckpt.pt")
     cached_model = None
-    
+
     # Safe glob search with timeout
     def find_model():
         try:
@@ -509,7 +519,7 @@ class AudioPlayer:
     def __init__(self, sample_rate):
         self.sample_rate = sample_rate
         self.active_stream = None
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()  # Changed from Lock to RLock to prevent deadlocks
     
     def play(self, audio_array, samplerate=None):
         with self.lock:
@@ -541,11 +551,12 @@ class AudioPlayer:
             if timeout is not None:
                 # Wait with timeout
                 start_time = time.time()
-                while sd.get_status().active and (time.time() - start_time) < timeout:
+                # Changed from sd.get_status().active to sd.get_stream().active
+                while sd.get_stream().active and (time.time() - start_time) < timeout:
                     time.sleep(0.1)
                 
                 # Force stop if still playing
-                if sd.get_status().active:
+                if sd.get_stream().active:
                     self.stop()
             else:
                 sd.wait()
@@ -802,6 +813,14 @@ def clean_text_for_speech(text):
     if not text:
         return "I'm sorry, I don't have a response."
         
+    # Replace smart quotes with straight ones
+    text = text.replace('\u2018', "'").replace('\u2019', "'")
+    text = text.replace('\u201c', '"').replace('\u201d', '"')
+    
+    # Replace other problematic Unicode characters
+    text = text.replace('\u2013', '-').replace('\u2014', '--')  # en-dash, em-dash
+    text = text.replace('\u2026', '...').replace('\u00a0', ' ')  # ellipsis, non-breaking space
+    
     # Remove any special characters that might cause issues
     text = re.sub(r'[^\w\s.,!?\'"-:;()]', ' ', text)
     
@@ -1062,16 +1081,27 @@ def generate_speech_safely(text, context, max_length_ms, temp):
         return None
         
     try:
+        # Clean memory before generation to improve performance
+        clean_memory()
+        
+        # Validate context to prevent errors
+        safe_context = []
+        if context and isinstance(context, list):
+            for item in context:
+                if isinstance(item, Segment):
+                    safe_context.append(item)
+        
         # Use the run_with_timeout function for safer speech generation
         def generate_func():
             return generator.generate(
                 text=text,
                 speaker=AI_SPEAKER_ID,
-                context=context if context else [],  # Ensure context is not None
+                context=safe_context,  # Ensure context is valid
                 max_audio_length_ms=max_length_ms,
                 temperature=temp,
             )
         
+        # Increased timeout for speech generation
         output, error = run_with_timeout(
             generate_func, 
             timeout=CONFIG["speech_timeout"]
@@ -1090,6 +1120,28 @@ def generate_speech_safely(text, context, max_length_ms, temp):
         if isinstance(output, torch.Tensor) and torch.isnan(output).any():
             print("⚠️ Speech output contains NaN values")
             return None
+        
+        # Ensure output is a properly shaped tensor
+        if isinstance(output, torch.Tensor):
+            # Remove any trailing silence
+            if output.numel() > sample_rate:  # At least 1 second
+                silence_threshold = 0.01
+                # Find the last non-silent sample
+                abs_audio = torch.abs(output)
+                # Get chunks and check if they're silent
+                chunk_size = sample_rate // 10  # 100ms chunks
+                non_silent_chunks = []
+                
+                for i in range(0, len(output), chunk_size):
+                    chunk = abs_audio[i:i+chunk_size]
+                    if chunk.max() > silence_threshold:
+                        non_silent_chunks.append(i // chunk_size)
+                
+                if non_silent_chunks:
+                    # Keep audio up to the last non-silent chunk plus 0.5 second padding
+                    last_chunk = non_silent_chunks[-1]
+                    end_sample = min(len(output), (last_chunk + 1) * chunk_size + sample_rate // 2)
+                    output = output[:end_sample]
             
         return output
     except Exception as e:
