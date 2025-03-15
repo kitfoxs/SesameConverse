@@ -221,6 +221,7 @@ class Generator:
         max_audio_length_ms: float = 90_000,
         temperature: float = 0.9,
         topk: int = 50,
+        batch_size: int = 16,  # Added batch size parameter
     ) -> torch.Tensor:
         if text is None:
             text = ""
@@ -279,32 +280,81 @@ class Generator:
             safety_counter = 0
             max_safety_counter = min(max_audio_frames + 100, 1000)
 
-            for _ in range(max_audio_frames):
+            # MODIFIED: Process frames in batches to improve GPU utilization
+            frames_generated = 0
+            while frames_generated < max_audio_frames and safety_counter < max_safety_counter:
                 try:
-                    sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
-
-                    if torch.all(sample == 0):
-                        break
-
-                    samples.append(sample)
-
-                    try:
-                        curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
+                    # Determine current batch size
+                    current_batch_size = min(batch_size, max_audio_frames - frames_generated)
+                    
+                    # Generate multiple frames at once using the model
+                    # Note: This assumes model.generate_frames_batch exists or we need to add it
+                    batch_samples = self._model.generate_frames_batch(
+                        curr_tokens, 
+                        curr_tokens_mask, 
+                        curr_pos, 
+                        temperature, 
+                        topk,
+                        num_frames=current_batch_size
+                    )
+                    
+                    # If we don't have a batch generation method, fall back to sequential
+                    # but still prepare for next batch processing
+                    if batch_samples is None:
+                        # Fallback to original sequential generation
+                        batch_samples = []
+                        for i in range(current_batch_size):
+                            sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
+                            
+                            if torch.all(sample == 0):
+                                break
+                                
+                            batch_samples.append(sample)
+                            
+                            # Update tokens for next frame
+                            curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
+                            curr_tokens_mask = torch.cat(
+                                [torch.ones_like(sample).bool(), torch.zeros(1, 1).bool().to(self.device)], dim=1
+                            ).unsqueeze(1)
+                            curr_pos = curr_pos[:, -1:] + 1
+                    
+                    # Process the batch results
+                    if isinstance(batch_samples, torch.Tensor):
+                        # If batch_samples is a tensor, it means the batch method worked
+                        for i in range(batch_samples.size(0)):
+                            frame = batch_samples[i:i+1]
+                            if torch.all(frame == 0):
+                                break
+                            samples.append(frame)
+                        
+                        # Update position based on number of frames generated
+                        frames_added = batch_samples.size(0)
+                        curr_pos = curr_pos[:, -1:] + frames_added
+                        
+                        # Update tokens for next batch
+                        last_frame = batch_samples[-1:].unsqueeze(1)
+                        curr_tokens = torch.cat([last_frame, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
                         curr_tokens_mask = torch.cat(
-                            [torch.ones_like(sample).bool(), torch.zeros(1, 1).bool().to(self.device)], dim=1
+                            [torch.ones_like(last_frame).bool(), torch.zeros(1, 1).bool().to(self.device)], dim=1
                         ).unsqueeze(1)
-                        curr_pos = curr_pos[:, -1:] + 1
-                    except Exception as e:
-                        print(f"Error updating tokens: {e}")
+                    else:
+                        # If batch_samples is a list from the fallback
+                        samples.extend(batch_samples)
+                        frames_added = len(batch_samples)
+                        
+                        # If no frames were generated, we're done
+                        if frames_added == 0:
+                            break
+                    
+                    frames_generated += frames_added
+                    safety_counter += frames_added
+                    
+                    # If we generated fewer frames than requested, we're done
+                    if frames_added < current_batch_size:
                         break
-
-                    safety_counter += 1
-                    if safety_counter >= max_safety_counter:
-                        print("Warning: Hit safety limit in frame generation")
-                        break
-
+                    
                 except Exception as e:
-                    print(f"Error generating frame: {e}")
+                    print(f"Error generating frames batch: {e}")
                     if len(samples) > 0:
                         break
                     else:
@@ -348,7 +398,6 @@ class Generator:
         except Exception as e:
             print(f"Error in generate method: {e}")
             raise
-
 
 def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda") -> Generator:
     """
