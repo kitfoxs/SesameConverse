@@ -2,10 +2,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torchtune
-from torchtune.models.gemma import gemma_12b
-
-def gemma12B() -> torchtune.modules.transformer.TransformerDecoder:
-    return gemma_12b()
 
 # Import the gemma function from the component builders
 try:
@@ -126,6 +122,71 @@ class Model(nn.Module):
         self.register_buffer("backbone_causal_mask", _create_causal_mask(self.backbone.max_seq_len, device))
         self.register_buffer("decoder_causal_mask", _create_causal_mask(self.args.audio_num_codebooks, device))
 
+    @torch.inference_mode()
+    def generate_frames_batch(self, tokens, tokens_mask, pos, temperature=0.9, topk=50, num_frames=16):
+        """Generate multiple audio frames at once to improve GPU utilization.
+        
+        Args:
+            tokens: Input tokens tensor
+            tokens_mask: Input tokens mask tensor
+            pos: Position tensor
+            temperature: Sampling temperature
+            topk: Top-k sampling parameter
+            num_frames: Number of frames to generate in this batch
+            
+        Returns:
+            Tensor containing generated frames, shape (num_frames, codebook_size)
+        """
+        try:
+            # Initialize storage for batch samples
+            batch_samples = []
+            
+            # Make deep copies to avoid modifying the original tensors
+            curr_tokens = tokens.clone()
+            curr_tokens_mask = tokens_mask.clone()
+            curr_pos = pos.clone()
+            
+            # Generate frames one by one, but prepare them as a batch
+            for i in range(num_frames):
+                # Generate a single frame
+                logits = self.forward(curr_tokens, curr_tokens_mask, curr_pos)
+                
+                # Apply temperature
+                if temperature > 0:
+                    logits = logits / temperature
+                
+                # Apply top-k if specified
+                if topk > 0:
+                    v, _ = torch.topk(logits, topk)
+                    logits[logits < v[:, [-1]]] = -float("Inf")
+                
+                # Sample from the logits
+                probs = torch.softmax(logits, dim=-1)
+                sample = torch.multinomial(probs, num_samples=1)
+                
+                # Check for end condition
+                if torch.all(sample == 0):
+                    break
+                    
+                batch_samples.append(sample)
+                
+                # Update for next iteration
+                curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(sample.device)], dim=1)
+                curr_tokens_mask = torch.cat(
+                    [torch.ones_like(sample).bool(), torch.zeros(1, 1).bool().to(sample.device)], dim=1
+                )
+                curr_pos = curr_pos[:, -1:] + 1
+            
+            if not batch_samples:
+                return None
+                
+            # Stack all generated samples
+            return torch.cat(batch_samples, dim=0)
+        
+        except Exception as e:
+            print(f"Error in generate_frames_batch: {e}")
+            return None
+            
     def generate_frame(
         self,
         tokens: torch.Tensor,
@@ -202,3 +263,27 @@ class Model(nn.Module):
         )
 
         return torch.cat([audio_embeds, text_embeds], dim=-2)
+
+    def forward(self, tokens, tokens_mask, input_pos):
+        """
+        Forward method needed for the generate_frames_batch method.
+        This should leverage the existing generation code to produce logits.
+        """
+        dtype = next(self.parameters()).dtype
+        
+        # Similar to generate_frame but returns logits instead of sampling
+        assert self.backbone.caches_are_enabled(), "backbone caches are not enabled"
+        curr_backbone_mask = _index_causal_mask(self.backbone_causal_mask, input_pos)
+        
+        # Embed tokens
+        embeds = self._embed_tokens(tokens)
+        masked_embeds = embeds * tokens_mask.unsqueeze(-1)
+        
+        # Summation across codebooks + text
+        h = masked_embeds.sum(dim=2)
+        h = self.backbone(h, input_pos=input_pos, mask=curr_backbone_mask).to(dtype=dtype)
+        
+        last_h = h[:, -1, :]
+        c0_logits = self.codebook0_head(last_h)
+        
+        return c0_logits
