@@ -155,6 +155,9 @@ class Generator:
             audio_tokens = self._audio_tokenizer.encode(audio.unsqueeze(0).unsqueeze(0))
             if isinstance(audio_tokens, tuple):
                 audio_tokens = audio_tokens[0]
+            # Handle additional nesting level
+            if isinstance(audio_tokens, list) or (isinstance(audio_tokens, torch.Tensor) and audio_tokens.dim() > 2):
+                audio_tokens = audio_tokens[0]
             if audio_tokens is None or audio_tokens.numel() == 0:
                 raise ValueError("Audio tokenization returned empty tokens")
 
