@@ -14,3 +14,4 @@ wheel==0.42.0
 setuptools==68.0.0
 ninja==1.11.1
 triton-windows==2.0.0
+faster-whisper==1.1.1
