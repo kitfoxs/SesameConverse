@@ -93,7 +93,8 @@ def check_requirements():
         "bitsandbytes": "bitsandbytes",  # Required for efficient loading of large models
         "scipy": "scipy",  # Required for audio processing
         "torch": "torch",
-        "torchaudio": "torchaudio"
+        "torchaudio": "torchaudio",
+        "faster_whisper": "faster-whisper"  # Added for Faster Whisper speech recognition
     }
     
     missing_packages = []
@@ -119,6 +120,53 @@ def check_requirements():
     import speech_recognition as sr
     from huggingface_hub import hf_hub_download
     from transformers import AutoModelForCausalLM, AutoTokenizer
+    
+    # Make sure SpeechRecognition has Faster Whisper integration
+    if not hasattr(sr.Recognizer, 'recognize_faster_whisper'):
+        print("⚠️ Your SpeechRecognition package does not have Faster Whisper integration.")
+        print("⚠️ You may need to use a patched version or add the integration manually.")
+        
+        # Try to add Faster Whisper integration to SpeechRecognition
+        try:
+            from faster_whisper import WhisperModel
+            
+            def recognize_faster_whisper(self, audio_data, model="base", language="en", beam_size=5, **kwargs):
+                """Performs speech recognition on ``audio_data`` using the Faster Whisper API.
+                
+                Returns the recognized text, or raises a ``speech_recognition.UnknownValueError`` exception
+                if the speech is unintelligible.
+                """
+                assert isinstance(audio_data, sr.AudioData), "``audio_data`` must be an ``AudioData`` instance"
+                
+                # Convert audio to the format required by Faster Whisper
+                wav_data = np.frombuffer(audio_data.get_wav_data(), dtype=np.int16).flatten().astype(np.float32) / 32768.0
+                
+                # Load the Faster Whisper model
+                whisper_model = WhisperModel(model, device="cuda" if torch.cuda.is_available() else "cpu")
+                
+                # Transcribe the audio
+                segments, info = whisper_model.transcribe(
+                    wav_data, 
+                    beam_size=beam_size, 
+                    language=language,
+                    **kwargs
+                )
+                
+                # Extract and combine the transcribed text
+                result = " ".join([segment.text for segment in segments])
+                
+                if not result:
+                    raise sr.UnknownValueError()
+                    
+                return result, info
+                
+            # Add the method to the Recognizer class
+            sr.Recognizer.recognize_faster_whisper = recognize_faster_whisper
+            print("✅ Successfully added Faster Whisper integration to SpeechRecognition")
+            
+        except Exception as e:
+            print(f"⚠️ Failed to add Faster Whisper integration: {e}")
+            print("⚠️ Falling back to Google Speech Recognition")
     
     return sr, hf_hub_download, AutoModelForCausalLM, AutoTokenizer
 
@@ -607,6 +655,7 @@ def select_microphone():
 mic_index = select_microphone()
 
 # Function to capture live microphone input
+# Function to capture live microphone input using Faster Whisper
 def recognize_speech():
     recognizer = sr.Recognizer()
     try:
@@ -656,41 +705,44 @@ def recognize_speech():
                 print(f"⚠️ Error with microphone: {e}")
                 return None, None
             
-        print("📝 Recognizing speech...")
+        print("📝 Recognizing speech with Faster Whisper...")
         
         # Try to get the audio with a timeout to prevent hanging
-        def recognize_with_google():
-            return recognizer.recognize_google(audio)
+        def recognize_with_whisper():
+            # Configure Faster Whisper with appropriate parameters
+            # You can adjust these parameters based on your needs
+            whisper_kwargs = {
+                "model": "base",  # Options: "tiny", "base", "small", "medium", "large"
+                "language": "en",  # Language code or "auto" for auto-detection
+                "beam_size": 5     # Higher values = better quality but slower
+            }
+            return recognizer.recognize_faster_whisper(audio, **whisper_kwargs)
             
-        text, error = run_with_timeout(recognize_with_google, timeout=10)
+        text_result, error = run_with_timeout(recognize_with_whisper, timeout=15)  # Increased timeout for whisper
         
         if error:
-            if isinstance(error, sr.RequestError) or "RequestError" in str(error):
-                print("⚠️ Could not reach Google Speech Recognition API")
-                # Fall back to Sphinx only if Google fails
-                try:
-                    # Check if PocketSphinx is available
-                    if hasattr(recognizer, "recognize_sphinx"):
-                        text = recognizer.recognize_sphinx(audio)
-                        print(f"🗨️ You (Sphinx fallback): {text}")
-                        return text, audio
-                    else:
-                        print("⚠️ Sphinx recognition not available")
-                        return None, None
-                except (ImportError, AttributeError):
-                    print("⚠️ Sphinx recognition not available")
+            print(f"⚠️ Whisper recognition error: {error}")
+            # Fall back to Google if whisper fails
+            try:
+                def recognize_with_google():
+                    return recognizer.recognize_google(audio)
+                text, google_error = run_with_timeout(recognize_with_google, timeout=10)
+                if google_error:
+                    print(f"⚠️ Google fallback also failed: {google_error}")
                     return None, None
-                except Exception as e:
-                    print(f"⚠️ Sphinx recognition failed: {e}")
-                    return None, None
-            elif isinstance(error, sr.UnknownValueError) or "UnknownValueError" in str(error):
-                print("⚠️ Could not understand audio")
-                return None, None
-            else:
-                print(f"⚠️ Recognition error: {error}")
+                print(f"🗨️ You (Google fallback): {text}")
+                return text, audio
+            except Exception as e:
+                print(f"⚠️ Recognition failed: {e}")
                 return None, None
         
-        if text:
+        # Faster Whisper typically returns a tuple with the text and additional details
+        if text_result and isinstance(text_result, tuple):
+            text = text_result[0]  # Extract just the recognized text
+        else:
+            text = text_result
+        
+        if text and isinstance(text, str) and text.strip():
             print(f"🗨️ You: {text}")
             return text, audio
         else:
@@ -701,6 +753,7 @@ def recognize_speech():
         raise KeyboardInterrupt("User interrupted speech recognition")
     except Exception as e:
         print(f"🚨 Error during speech recognition: {e}")
+        traceback.print_exc()
         return None, None
 
 # Function to convert speech_recognition audio to tensor
