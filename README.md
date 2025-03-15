@@ -7,7 +7,7 @@ I've uploaded all the updated relevant files to the repo, you should be able to 
 
 Main points are: Swap Models.py with mine, launch the model via "python SesameConverse.py" once all dependencies are installed. You also need my generator.py. Lastly, **after** you install all the build requirements in requirements.txt (and others I still need to update it with), you must switch my "_model_builders.py" in the folder in the repo with the one that is created after torchtune is installed by default via the "pip install -r requirements.txt" command. 
 
-The values in "_model_builders.py" for Gemma 3 models are placeholders. All Gemma 3 values (temp, etc) are placeholders, I'll leave tweaking that to find the best settings to you guys.
+All Gemma 3 values values in "_model_builders.py" for Gemma 3 models are placeholders (temp, etc), I'll leave tweaking that to find the best settings to you guys.
 
 
 ------------------------------------------------------------------
