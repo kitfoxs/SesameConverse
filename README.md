@@ -6,7 +6,7 @@ I got Sesame to build with Gemma 3 without errors before I went to sleep finally
 
 I've uploaded all the updated relevant files to the repo, you should be able to go from here if you don't want to wait for me to put up step by step instructions for how I got to where I am.
 
-Main points are: Swap Models.py with mine, . You also need my generator.py. Lastly, after you install all the build requirements in requirements.txt (and others I still need to update it with), you must switch the "_model_builders.py" in the folder in the repo with the one that is created after torchtune is installed via the "pip install -r requirements.txt" command. Launch the model via "python SesameConverse.py" once all dependencies are installed and all 3 files have been replaced with mine (generator.py, models.py, _model_builders.py)
+Main points are: Swap Models.py with mine, launch the model via "python SesameConverse.py" once all dependencies are installed. You also need my generator.py. Lastly, **after** you install all the build requirements in requirements.txt (and others I still need to update it with), you must switch the "_model_builders.py" in the folder in the repo with the one that is created after torchtune is installed via the "pip install -r requirements.txt" command.
 
 ------------------------------------------------------------------
 
