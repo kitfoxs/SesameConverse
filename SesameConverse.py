@@ -253,17 +253,19 @@ def configure_settings():
         "recovery_audio_ms": 3000,  # Short audio duration for recovery
         "gemma_max_tokens": 100,  # Default max tokens for Gemma responses
         "model_timeout": 300,   # Timeout for model loading (seconds)
-        "speech_timeout": 180,  # Timeout for speech generation (seconds) - Increased from 60 to 180
-        "silence_threshold": 0.005  # Threshold for detecting silent audio
+        "speech_timeout": 180,  # Timeout for speech generation (seconds)
+        "silence_threshold": 0.005,  # Threshold for detecting silent audio
+        "batch_size": 16,       # Default batch size for audio frame generation
+        "use_cuda_graphs": True # Enable CUDA graphs for better performance
     }
     
     # Platform-specific optimizations
     if platform.system() == 'Windows':
         # Windows often needs larger timeouts
         settings["model_timeout"] = 400
-        settings["speech_timeout"] = 220  # Increased from 80 to 220
+        settings["speech_timeout"] = 220
     
-    # Adjust settings for low-memory devices
+    # Adjust settings for CPU mode
     if device == "cpu":
         settings["context_size"] = 4
         settings["context_limit"] = 2
@@ -271,29 +273,79 @@ def configure_settings():
         settings["recovery_audio_ms"] = 2000
         settings["gemma_max_tokens"] = 50
         settings["model_timeout"] = 600  # Longer timeout for CPU
+        settings["batch_size"] = 1       # No batching on CPU
+        settings["use_cuda_graphs"] = False
+        print("🖥️ CPU mode: Setting batch size to 1")
+    
     elif device == "cuda":
-        # Check GPU memory and adjust accordingly
+        # Automatic batch size configuration based on available GPU memory
         try:
             gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9  # GB
-            if gpu_mem < 8:  # Less than 8GB
+            free_mem = gpu_mem - (torch.cuda.memory_allocated() / 1e9)
+            
+            print(f"📊 Available GPU memory: {free_mem:.2f}GB of {gpu_mem:.2f}GB total")
+            
+            # Dynamically set batch size based on available memory
+            if gpu_mem < 4:  # Very limited VRAM (<4GB)
+                settings["batch_size"] = 2
+                print("⚠️ Very limited GPU memory: Setting batch size to 2")
+                # Also reduce other memory-intensive settings
+                settings["context_size"] = 3
+                settings["context_limit"] = 1
+                settings["max_audio_length"] = 6000
+            elif gpu_mem < 8:  # Limited VRAM (4-8GB)
+                settings["batch_size"] = 4
+                print("⚠️ Limited GPU memory: Setting batch size to 4")
+                # Also reduce other settings
                 settings["context_size"] = 4
                 settings["context_limit"] = 2
                 settings["max_audio_length"] = 8000
-                settings["gemma_max_tokens"] = 30
-                print("⚠️ Very limited GPU memory detected, reducing settings significantly")
-            elif gpu_mem < 16:  # Less than 16GB
+            elif gpu_mem < 12:  # Mid-range VRAM (8-12GB)
+                settings["batch_size"] = 8
+                print("📊 Mid-range GPU memory: Setting batch size to 8")
                 settings["context_size"] = 6
-                settings["context_limit"] = 2
                 settings["max_audio_length"] = 12000
-                settings["gemma_max_tokens"] = 50
-                print("⚠️ Limited GPU memory detected, reducing context size")
-            elif gpu_mem > 32:  # More than 32GB
+            elif gpu_mem < 16:  # Good VRAM (12-16GB)
+                settings["batch_size"] = 16
+                print("📊 Good GPU memory: Setting batch size to 16")
+            elif gpu_mem < 24:  # High-end VRAM (16-24GB)
+                settings["batch_size"] = 24
+                print("📊 High-end GPU memory: Setting batch size to 24")
+                settings["context_size"] = 10
+                settings["max_audio_length"] = 25000
+            else:  # Very high-end VRAM (>24GB)
+                settings["batch_size"] = 32
+                print("📊 Very high-end GPU memory: Setting batch size to 32")
                 settings["context_size"] = 12
                 settings["context_limit"] = 8
                 settings["max_audio_length"] = 30000
-                settings["gemma_max_tokens"] = 150
+
+            # Add more specific settings for known GPU models
+            gpu_name = torch.cuda.get_device_name(0).lower()
+            
+            # Specific optimizations for known GPU models
+            if any(x in gpu_name for x in ["3090", "4090", "a100", "h100"]):
+                # High-end GPUs with good tensor cores
+                settings["batch_size"] = min(32, settings["batch_size"])
+            elif any(x in gpu_name for x in ["1650", "1660", "1050", "1060"]):
+                # Older GPUs may need more conservative settings
+                settings["batch_size"] = min(4, settings["batch_size"])
+                settings["use_cuda_graphs"] = False  # May not be well supported
+            
+            # If very high CUDA memory usage detected, reduce batch size
+            if torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory > 0.7:
+                print("⚠️ High GPU memory usage detected, reducing batch size")
+                settings["batch_size"] = max(2, settings["batch_size"] // 2)
+                
         except Exception as e:
-            print(f"⚠️ Could not check GPU memory: {e}")
+            print(f"⚠️ Could not detect GPU memory details: {e}")
+            # Fall back to conservative default
+            settings["batch_size"] = 8
+    
+    # Print batch size info for user
+    if device == "cuda":
+        print(f"🚀 Batch processing: Using batch size of {settings['batch_size']} for speech generation")
+        
     return settings
 
 CONFIG = configure_settings()
@@ -1146,12 +1198,14 @@ def generate_speech_safely(text, context, max_length_ms, temp):
         
         # Use the run_with_timeout function for safer speech generation
         def generate_func():
+            # Pass batch_size from CONFIG to enable batch processing
             return generator.generate(
                 text=text,
                 speaker=AI_SPEAKER_ID,
                 context=safe_context,  # Ensure context is valid
                 max_audio_length_ms=max_length_ms,
                 temperature=temp,
+                batch_size=CONFIG.get("batch_size", 16),  # Get batch size from CONFIG with fallback
             )
         
         # Increased timeout for speech generation
